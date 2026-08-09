@@ -3,7 +3,7 @@ name: NSE Inside Bar Scanner
 on:
   schedule:
     - cron: "30 3-9 * * 1-5"
-    - cron: "0 11 * * 1-5"
+    - cron: "30 9 * * 1-5"
   workflow_dispatch:
     inputs:
       timeframe:
