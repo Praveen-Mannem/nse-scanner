@@ -3,8 +3,10 @@
 NSE Inside Bar Scanner — local Python version, writes results into Google Sheets.
 
 WHAT IT DOES
-    Scans NSE symbols priced at or below --max-price (default Rs 500) for the
-    "inside bar" pattern on either a daily or hourly timeframe, and writes
+    Scans NSE symbols priced at or below --max-price (default Rs 500), while
+    skipping low-liquidity names using --min-avg-volume and
+    --min-turnover-lakhs, for the "inside bar" pattern on either a daily or
+    hourly timeframe, and writes
     color-coded signals into a worksheet tab of your Google Sheet:
         WATCH              -> latest candle is an inside bar (amber). No
                                trade yet, a name to watch for the next
@@ -39,6 +41,7 @@ USAGE
     python nse_scanner.py --timeframe daily
     python nse_scanner.py --timeframe hourly
     python nse_scanner.py --timeframe daily --max-price 300
+    python nse_scanner.py --timeframe daily --min-avg-volume 200000 --min-turnover-lakhs 100
     python nse_scanner.py --timeframe daily --symbols-file my_symbols.txt
 
 See SETUP.md for one-time Google Sheets credential setup and how to
@@ -62,6 +65,8 @@ SPREADSHEET_ID = "1YDfmA6wa8t8uqPsavOfsvPzM8SpOTFgxql9wp-07uKk"  # from your she
 
 CONFIG = {
     "vol_ratio_min": 1.5,
+    "min_avg_volume": 100_000,
+    "min_turnover_lakhs": 50.0,
     "rsi_bull_min": 40, "rsi_bull_max": 80,
     "rsi_bear_min": 20, "rsi_bear_max": 60,
     "default_max_price": 500.0,
@@ -100,8 +105,8 @@ WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 HEADER = [
     "Symbol", "Signal", "Pattern", "Mother High", "Mother Low",
-    "Last Close", "Vol Ratio", "Trend vs EMA", "RSI", "Score",
-    "Entry", "Stop Loss", "Target", "Updated At",
+    "Last Close", "Avg Volume", "Turnover (L)", "Vol Ratio",
+    "Trend vs EMA", "RSI", "Score", "Entry", "Stop Loss", "Target", "Updated At",
 ]
 
 
@@ -231,7 +236,13 @@ def calc_rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 # ============================ CORE LOGIC ====================================
-def analyze_symbol(symbol: str, df: pd.DataFrame, tf: dict) -> dict | None:
+def analyze_symbol(
+    symbol: str,
+    df: pd.DataFrame,
+    tf: dict,
+    min_avg_volume: int,
+    min_turnover_lakhs: float,
+) -> dict | None:
     if df is None or len(df) < tf["min_candles"]:
         return None
 
@@ -248,11 +259,25 @@ def analyze_symbol(symbol: str, df: pd.DataFrame, tf: dict) -> dict | None:
     avg_vol = vol.iloc[max(0, n - 1 - tf["vol_avg_period"]) : n - 1].mean()
 
     today, prev1, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    last_close = float(today["Close"])
+    turnover_lakhs = (last_close * float(avg_vol)) / 100_000 if avg_vol and avg_vol > 0 else 0
+
+    # Avoid illiquid names where scanner signals are easier to distort and
+    # harder to trade. The turnover check prevents very low-priced shares from
+    # passing only because they print many small-volume shares.
+    if (
+        pd.isna(avg_vol)
+        or avg_vol < min_avg_volume
+        or turnover_lakhs < min_turnover_lakhs
+    ):
+        return None
 
     result = {
         "symbol": symbol, "pattern": "", "signal": "NONE",
         "mother_high": None, "mother_low": None,
-        "last_close": round(float(today["Close"]), 2),
+        "last_close": round(last_close, 2),
+        "avg_volume": int(round(float(avg_vol))),
+        "turnover_lakhs": round(float(turnover_lakhs), 2),
         "vol_ratio": None, "trend": "", "rsi": round(float(rsi_last), 2), "score": 0,
         "entry": "", "stop_loss": "", "target": "",
         "updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M"),
@@ -323,6 +348,17 @@ def get_gspread_client(credentials_path: str):
     return gspread.authorize(creds)
 
 
+def result_sort_key(result: dict) -> tuple:
+    """Rank actionable, liquid, high-confirmation setups first."""
+    return (
+        SIGNAL_RANK.get(result["signal"], 9),
+        -result["score"],
+        -float(result.get("vol_ratio") or 0),
+        -float(result.get("turnover_lakhs") or 0),
+        result["symbol"],
+    )
+
+
 def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict]):
     import gspread
 
@@ -332,11 +368,12 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=sheet_name, rows=2000, cols=len(HEADER) + 2)
 
-    results_sorted = sorted(results, key=lambda r: (SIGNAL_RANK.get(r["signal"], 9), -r["score"]))
+    results_sorted = sorted(results, key=result_sort_key)
     rows = [
         [r["symbol"], r["signal"], r["pattern"], r["mother_high"], r["mother_low"],
-         r["last_close"], r["vol_ratio"], r["trend"], r["rsi"], r["score"],
-         r["entry"], r["stop_loss"], r["target"], r["updated_at"]]
+         r["last_close"], r["avg_volume"], r["turnover_lakhs"], r["vol_ratio"],
+         r["trend"], r["rsi"], r["score"], r["entry"], r["stop_loss"],
+         r["target"], r["updated_at"]]
         for r in results_sorted
     ]
 
@@ -390,6 +427,12 @@ def main():
                          help="Symbols per Yahoo Finance batch request.")
     parser.add_argument("--max-price", type=float, default=CONFIG["default_max_price"],
                          help="Only report stocks priced at or below this (Rs). Default 500.")
+    parser.add_argument("--min-avg-volume", type=int, default=CONFIG["min_avg_volume"],
+                         help="Only report stocks whose prior average volume meets this threshold. "
+                              "Default 100000 shares.")
+    parser.add_argument("--min-turnover-lakhs", type=float, default=CONFIG["min_turnover_lakhs"],
+                         help="Only report stocks whose average rupee turnover meets this threshold, "
+                              "in lakhs. Default 50.")
     parser.add_argument("--force", action="store_true",
                          help="Run an hourly scan even outside market hours (for testing).")
     args = parser.parse_args()
@@ -404,7 +447,12 @@ def main():
     print(f"Loaded {len(all_symbols)} symbols. Filtering to price <= Rs {args.max_price}...")
 
     symbols = prefilter_by_price(all_symbols, args.max_price, args.chunk_size)
-    print(f"{len(symbols)} symbols at or below Rs {args.max_price}. Running {args.timeframe} scan...")
+    print(
+        f"{len(symbols)} symbols at or below Rs {args.max_price}. "
+        f"Skipping stocks below {args.min_avg_volume:,} avg volume or "
+        f"Rs {args.min_turnover_lakhs:g}L average turnover. "
+        f"Running {args.timeframe} scan..."
+    )
 
     if not symbols:
         print("No symbols left after the price filter — nothing to scan.")
@@ -424,7 +472,7 @@ def main():
         for sym in chunk:
             try:
                 df = extract_symbol_df(data, sym, len(chunk))
-                r = analyze_symbol(sym, df, tf)
+                r = analyze_symbol(sym, df, tf, args.min_avg_volume, args.min_turnover_lakhs)
                 if r:
                     results.append(r)
             except Exception:
