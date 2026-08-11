@@ -164,13 +164,31 @@ def fetch_batch(symbols: list[str], interval: str, period: str) -> pd.DataFrame:
 
 def extract_symbol_df(data: pd.DataFrame, symbol: str, chunk_len: int) -> pd.DataFrame | None:
     ticker = symbol + ".NS"
-    if chunk_len == 1:
-        df = data.copy()
-    else:
-        if ticker not in data.columns.get_level_values(0):
+    
+    # Modern yfinance returns MultiIndex even for single tickers.
+    if isinstance(data.columns, pd.MultiIndex):
+        if ticker in data.columns.get_level_values(0):
+            df = data[ticker].copy()
+        elif ticker in data.columns.get_level_values(1):
+            df = data.xs(ticker, level=1, axis=1).copy()
+        else:
             return None
-        df = data[ticker].copy()
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    else:
+        # Fallback for older yfinance when len(tickers) == 1 it returns flat columns
+        df = data.copy()
+        
+    if df is None or len(df) == 0:
+        return None
+
+    # Handle cases where the remaining columns might still be a MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    try:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    except KeyError:
+        return None
+        
     return df if len(df) > 0 else None
 
 
