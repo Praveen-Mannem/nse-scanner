@@ -6,8 +6,8 @@ WHAT IT DOES
     Scans NSE symbols priced at or below --max-price (default Rs 500), while
     skipping low-liquidity names using --min-avg-volume and
     --min-turnover-lakhs, for the "inside bar" pattern on either a daily or
-    hourly timeframe, and writes
-    color-coded signals into a worksheet tab of your Google Sheet:
+    hourly timeframe, and writes color-coded signals into a worksheet tab of
+    your Google Sheet:
         WATCH              -> latest candle is an inside bar (amber). No
                                trade yet, a name to watch for the next
                                candle's breakout.
@@ -25,6 +25,14 @@ WHAT IT DOES
                  target = mother low  - (mother high - mother low)
         WATCH:   both potential trigger levels are shown; direction isn't
                  known yet so no stop/target until it actually breaks out.
+
+PATTERN LOGIC (3-candle window, newest = candle[-1]):
+    candle[-3] = mother bar candidate (for confirmed breakout check)
+    candle[-2] = inside bar candidate (must be inside candle[-3] high/low)
+    candle[-1] = breakout/signal candle:
+        - If candle[-2] was inside candle[-3] AND candle[-1] closes
+          beyond candle[-3] high/low => BULLISH / BEARISH
+        - If candle[-1] is inside candle[-2]  => WATCH (fresh inside bar)
 
 TWO-STAGE SCAN (keeps this fast even across the whole NSE list)
     Stage 1: a quick 5-day price check on every symbol, to drop anything
@@ -168,24 +176,37 @@ def fetch_batch(symbols: list[str], interval: str, period: str) -> pd.DataFrame:
 
 
 def extract_symbol_df(data: pd.DataFrame, symbol: str, chunk_len: int) -> pd.DataFrame | None:
+    """
+    Extract per-symbol OHLCV DataFrame from a yfinance batch download result.
+
+    yfinance >= 0.2 returns a MultiIndex with (field, ticker) at the column level,
+    i.e. level-0 = field ('Open','High','Low','Close','Volume','Adj Close'),
+         level-1 = ticker ('RELIANCE.NS', ...).
+    Older versions used (ticker, field) OR flat columns when only 1 ticker was fetched.
+    We handle all three cases explicitly to avoid the most common source of false signals.
+    """
     ticker = symbol + ".NS"
-    
-    # Modern yfinance returns MultiIndex even for single tickers.
+
     if isinstance(data.columns, pd.MultiIndex):
-        if ticker in data.columns.get_level_values(0):
-            df = data[ticker].copy()
-        elif ticker in data.columns.get_level_values(1):
+        level0_vals = data.columns.get_level_values(0).unique().tolist()
+        level1_vals = data.columns.get_level_values(1).unique().tolist()
+
+        # Modern yfinance: level-0 = field, level-1 = ticker  e.g. ('Close', 'RELIANCE.NS')
+        if ticker in level1_vals:
             df = data.xs(ticker, level=1, axis=1).copy()
+        # Legacy yfinance: level-0 = ticker, level-1 = field  e.g. ('RELIANCE.NS', 'Close')
+        elif ticker in level0_vals:
+            df = data[ticker].copy()
         else:
             return None
     else:
-        # Fallback for older yfinance when len(tickers) == 1 it returns flat columns
+        # Single-ticker download — yfinance returns flat columns directly
         df = data.copy()
-        
+
     if df is None or len(df) == 0:
         return None
 
-    # Handle cases where the remaining columns might still be a MultiIndex
+    # If there are still nested column levels (edge-case), flatten them
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -193,7 +214,7 @@ def extract_symbol_df(data: pd.DataFrame, symbol: str, chunk_len: int) -> pd.Dat
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
     except KeyError:
         return None
-        
+
     return df if len(df) > 0 else None
 
 
@@ -215,6 +236,8 @@ def prefilter_by_price(symbols: list[str], max_price: float, chunk_size: int) ->
                 if df is None or len(df) == 0:
                     continue
                 last_close = float(df["Close"].iloc[-1])
+                if pd.isna(last_close):
+                    continue
                 if last_close <= max_price:
                     keep.append(sym)
             except Exception:
@@ -243,6 +266,37 @@ def analyze_symbol(
     min_avg_volume: int,
     min_turnover_lakhs: float,
 ) -> dict | None:
+    """
+    Evaluate the last 3 candles for inside-bar breakout signals.
+
+    Candle window (newest last):
+        df.iloc[-3]  = candle_3  (potential mother bar for confirmed breakout)
+        df.iloc[-2]  = candle_2  (potential inside bar / mother bar for WATCH)
+        df.iloc[-1]  = candle_1  (the current / most-recent candle)
+
+    CONFIRMED BREAKOUT  (BULLISH / BEARISH):
+        Condition:  candle_2 is fully inside candle_3
+                    AND candle_1 closes ABOVE candle_3 high  → BULLISH
+                    OR  candle_1 closes BELOW candle_3 low   → BEARISH
+        Rationale:  We require the close to decisively exceed the MOTHER bar's
+                    range, not just the inside bar's range, to avoid weak
+                    breakouts that stall at the inside bar's edges.
+
+    WATCH:
+        Condition:  candle_1 is fully inside candle_2 (fresh inside bar).
+        Rationale:  Direction is unknown; show both trigger levels so the
+                    trader can set a bracket order for the next session.
+
+    Scoring (0-3, applied only to confirmed breakouts):
+        +1  trend  — close is on the correct side of the 50-period EMA
+        +1  volume — breakout-candle volume >= 1.5× the 20-period average
+        +1  RSI    — RSI(14) is in a momentum-sane band (not overbought/oversold)
+
+    Liquidity gate (applied before any pattern checks):
+        Skips stocks where the 20-period average volume < min_avg_volume OR
+        average rupee turnover < min_turnover_lakhs. This prevents signals
+        on stocks that are technically clean but impossible/expensive to trade.
+    """
     if df is None or len(df) < tf["min_candles"]:
         return None
 
@@ -252,80 +306,140 @@ def analyze_symbol(
     rsi = calc_rsi(closes, tf["rsi_period"])
     vol = df["Volume"]
 
-    ema_last, rsi_last = ema.iloc[-1], rsi.iloc[-1]
+    ema_last = ema.iloc[-1]
+    rsi_last = rsi.iloc[-1]
     if pd.isna(ema_last) or pd.isna(rsi_last):
         return None
 
+    # Volume average over the 20 candles BEFORE the current one (exclude current)
     avg_vol = vol.iloc[max(0, n - 1 - tf["vol_avg_period"]) : n - 1].mean()
 
-    today, prev1, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-    last_close = float(today["Close"])
-    turnover_lakhs = (last_close * float(avg_vol)) / 100_000 if avg_vol and avg_vol > 0 else 0
+    # ----- 3-candle window -----
+    # candle_1 = most recent (the signal / breakout candle)
+    # candle_2 = one before that (inside bar candidate or mother bar for WATCH)
+    # candle_3 = two before that (mother bar candidate for confirmed breakout)
+    candle_1 = df.iloc[-1]
+    candle_2 = df.iloc[-2]
+    candle_3 = df.iloc[-3]
 
-    # Avoid illiquid names where scanner signals are easier to distort and
-    # harder to trade. The turnover check prevents very low-priced shares from
-    # passing only because they print many small-volume shares.
-    if (
-        pd.isna(avg_vol)
-        or avg_vol < min_avg_volume
-        or turnover_lakhs < min_turnover_lakhs
-    ):
+    # Guard: ensure OHLC values are usable floats
+    try:
+        c1_high  = float(candle_1["High"])
+        c1_low   = float(candle_1["Low"])
+        c1_close = float(candle_1["Close"])
+        c1_vol   = float(candle_1["Volume"])
+        c2_high  = float(candle_2["High"])
+        c2_low   = float(candle_2["Low"])
+        c3_high  = float(candle_3["High"])
+        c3_low   = float(candle_3["Low"])
+    except (TypeError, ValueError):
         return None
+
+    if any(pd.isna(v) for v in [c1_high, c1_low, c1_close, c2_high, c2_low, c3_high, c3_low]):
+        return None
+
+    # ── Liquidity gate ──────────────────────────────────────────────────────
+    # Compute daily turnover in lakhs using last close × avg volume
+    avg_vol_safe = float(avg_vol) if (avg_vol is not None and not pd.isna(avg_vol)) else 0.0
+    turnover_lakhs = (c1_close * avg_vol_safe) / 100_000 if avg_vol_safe > 0 else 0.0
+
+    if avg_vol_safe < min_avg_volume or turnover_lakhs < min_turnover_lakhs:
+        return None
+    # ────────────────────────────────────────────────────────────────────────
 
     result = {
         "symbol": symbol, "pattern": "", "signal": "NONE",
         "mother_high": None, "mother_low": None,
-        "last_close": round(last_close, 2),
-        "avg_volume": int(round(float(avg_vol))),
-        "turnover_lakhs": round(float(turnover_lakhs), 2),
+        "last_close": round(c1_close, 2),
+        "avg_volume": int(round(avg_vol_safe)),
+        "turnover_lakhs": round(turnover_lakhs, 2),
         "vol_ratio": None, "trend": "", "rsi": round(float(rsi_last), 2), "score": 0,
         "entry": "", "stop_loss": "", "target": "",
         "updated_at": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M"),
     }
 
-    # Case 1: confirmed breakout
-    if prev1["High"] <= prev2["High"] and prev1["Low"] >= prev2["Low"]:
-        mother_high = round(float(prev2["High"]), 2)
-        mother_low = round(float(prev2["Low"]), 2)
+    # ------------------------------------------------------------------ #
+    #  Case 1: CONFIRMED BREAKOUT                                         #
+    #    candle_2 is an inside bar relative to candle_3 (mother bar),     #
+    #    AND candle_1 (current) closes beyond the mother bar's range.     #
+    # ------------------------------------------------------------------ #
+    candle_2_is_inside_candle_3 = (c2_high <= c3_high) and (c2_low >= c3_low)
+
+    if candle_2_is_inside_candle_3:
+        mother_high = round(c3_high, 2)
+        mother_low  = round(c3_low,  2)
         rng = round(mother_high - mother_low, 2)
-        vol_ratio = (today["Volume"] / avg_vol) if avg_vol and avg_vol > 0 else None
 
-        if today["Close"] > prev2["High"]:
-            result.update(pattern="Breakout confirmed", signal="BULLISH",
-                           mother_high=mother_high, mother_low=mother_low,
-                           entry=mother_high, stop_loss=mother_low,
-                           target=round(mother_high + rng, 2),
-                           vol_ratio=round(float(vol_ratio), 2) if vol_ratio is not None else None)
-            result["trend"] = f"above EMA{tf['ema_trend']}" if today["Close"] > ema_last else f"below EMA{tf['ema_trend']}"
-            if today["Close"] > ema_last:
-                result["score"] += 1
-            if vol_ratio is not None and vol_ratio >= CONFIG["vol_ratio_min"]:
-                result["score"] += 1
-            if CONFIG["rsi_bull_min"] <= rsi_last <= CONFIG["rsi_bull_max"]:
-                result["score"] += 1
+        # Vol ratio: use candle_1 volume vs prior 20-candle average
+        c1_vol_safe = c1_vol if not pd.isna(c1_vol) else 0.0
+        vol_ratio = (c1_vol_safe / avg_vol_safe) if avg_vol_safe > 0 else None
+        safe_vol_ratio = round(float(vol_ratio), 2) if (vol_ratio is not None and not pd.isna(vol_ratio)) else None
 
-        elif today["Close"] < prev2["Low"]:
-            result.update(pattern="Breakout confirmed", signal="BEARISH",
-                           mother_high=mother_high, mother_low=mother_low,
-                           entry=mother_low, stop_loss=mother_high,
-                           target=round(mother_low - rng, 2),
-                           vol_ratio=round(float(vol_ratio), 2) if vol_ratio is not None else None)
-            result["trend"] = f"below EMA{tf['ema_trend']}" if today["Close"] < ema_last else f"above EMA{tf['ema_trend']}"
-            if today["Close"] < ema_last:
+        if c1_close > c3_high:          # BULLISH breakout
+            result.update(
+                pattern="Breakout confirmed",
+                signal="BULLISH",
+                mother_high=mother_high,
+                mother_low=mother_low,
+                entry=mother_high,
+                stop_loss=mother_low,
+                target=round(mother_high + rng, 2),
+                vol_ratio=safe_vol_ratio,
+            )
+            result["trend"] = (
+                f"above EMA{tf['ema_trend']}" if c1_close > float(ema_last)
+                else f"below EMA{tf['ema_trend']}"
+            )
+            if c1_close > float(ema_last):
                 result["score"] += 1
-            if vol_ratio is not None and vol_ratio >= CONFIG["vol_ratio_min"]:
+            if safe_vol_ratio is not None and safe_vol_ratio >= CONFIG["vol_ratio_min"]:
                 result["score"] += 1
-            if CONFIG["rsi_bear_min"] <= rsi_last <= CONFIG["rsi_bear_max"]:
+            if CONFIG["rsi_bull_min"] <= float(rsi_last) <= CONFIG["rsi_bull_max"]:
                 result["score"] += 1
 
-    # Case 2: fresh inside bar -> watchlist (direction unknown, show both triggers)
-    if result["signal"] == "NONE" and today["High"] <= prev1["High"] and today["Low"] >= prev1["Low"]:
-        mother_high = round(float(prev1["High"]), 2)
-        mother_low = round(float(prev1["Low"]), 2)
-        result.update(pattern="Inside bar (watchlist)", signal="WATCH",
-                       mother_high=mother_high, mother_low=mother_low,
-                       entry=f"Buy>{mother_high} / Sell<{mother_low}")
-        result["trend"] = f"above EMA{tf['ema_trend']}" if today["Close"] > ema_last else f"below EMA{tf['ema_trend']}"
+        elif c1_close < c3_low:         # BEARISH breakout
+            result.update(
+                pattern="Breakout confirmed",
+                signal="BEARISH",
+                mother_high=mother_high,
+                mother_low=mother_low,
+                entry=mother_low,
+                stop_loss=mother_high,
+                target=round(mother_low - rng, 2),
+                vol_ratio=safe_vol_ratio,
+            )
+            result["trend"] = (
+                f"below EMA{tf['ema_trend']}" if c1_close < float(ema_last)
+                else f"above EMA{tf['ema_trend']}"
+            )
+            if c1_close < float(ema_last):
+                result["score"] += 1
+            if safe_vol_ratio is not None and safe_vol_ratio >= CONFIG["vol_ratio_min"]:
+                result["score"] += 1
+            if CONFIG["rsi_bear_min"] <= float(rsi_last) <= CONFIG["rsi_bear_max"]:
+                result["score"] += 1
+
+    # ------------------------------------------------------------------ #
+    #  Case 2: FRESH INSIDE BAR → WATCH                                   #
+    #    candle_1 (the just-closed candle) is inside candle_2.            #
+    #    No confirmed breakout yet — alert the trader to watch.           #
+    # ------------------------------------------------------------------ #
+    if result["signal"] == "NONE":
+        candle_1_is_inside_candle_2 = (c1_high <= c2_high) and (c1_low >= c2_low)
+        if candle_1_is_inside_candle_2:
+            mother_high = round(c2_high, 2)
+            mother_low  = round(c2_low,  2)
+            result.update(
+                pattern="Inside bar (watchlist)",
+                signal="WATCH",
+                mother_high=mother_high,
+                mother_low=mother_low,
+                entry=f"Buy>{mother_high} / Sell<{mother_low}",
+            )
+            result["trend"] = (
+                f"above EMA{tf['ema_trend']}" if c1_close > float(ema_last)
+                else f"below EMA{tf['ema_trend']}"
+            )
 
     return result if result["signal"] != "NONE" else None
 
@@ -394,7 +508,10 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
     if rows:
         block_start = 0
         for i in range(1, len(results_sorted) + 1):
-            changed = i == len(results_sorted) or results_sorted[i]["signal"] != results_sorted[block_start]["signal"]
+            changed = (
+                i == len(results_sorted)
+                or results_sorted[i]["signal"] != results_sorted[block_start]["signal"]
+            )
             if changed:
                 signal = results_sorted[block_start]["signal"]
                 color = SIGNAL_COLOR.get(signal)

@@ -1,9 +1,24 @@
 name: NSE Inside Bar Scanner
 
+# ─── Schedule overview (all times UTC → IST = UTC+5:30) ───────────────────
+#
+#  Hourly scan  runs every hour from 03:30 UTC to 10:00 UTC on weekdays,
+#               which maps to 09:00–15:30 IST (NSE market hours).
+#               Cron fires at HH:30 UTC so the scan starts just after the
+#               candle closes at the top of the hour.
+#
+#  Daily scan   runs once at 10:30 UTC (16:00 IST), after NSE close,
+#               so the final day candle is complete and confirmed.
+#
+#  Manual run   available via workflow_dispatch; choose daily or hourly.
+# ──────────────────────────────────────────────────────────────────────────
+
 on:
   schedule:
-    - cron: "30 3-8 * * 1-5"
-    - cron: "30 9 * * 1-5"
+    # Hourly scan: 03:30–09:30 UTC every weekday  (= 09:00–15:00 IST)
+    - cron: "30 3-9 * * 1-5"
+    # Daily scan:  10:30 UTC every weekday         (= 16:00 IST, post-market)
+    - cron: "30 10 * * 1-5"
   workflow_dispatch:
     inputs:
       timeframe:
@@ -20,10 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -35,14 +50,19 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
+      # ── Hourly scan ──
+      # Runs only for the 03:30–09:30 UTC cron triggers (not the 10:30 daily one).
       - name: Run hourly scan (scheduled)
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && github.event.schedule == '30 3-9 * * 1-5'
         run: python nse_scanner.py --timeframe hourly
 
+      # ── Daily scan ──
+      # Runs only for the 10:30 UTC cron trigger.
       - name: Run daily scan (scheduled)
-        if: github.event.schedule == '30 9 * * 1-5'
+        if: github.event_name == 'schedule' && github.event.schedule == '30 10 * * 1-5'
         run: python nse_scanner.py --timeframe daily
 
+      # ── Manual run ──
       - name: Run manual scan
         if: github.event_name == 'workflow_dispatch'
         run: python nse_scanner.py --timeframe ${{ github.event.inputs.timeframe }} --force
