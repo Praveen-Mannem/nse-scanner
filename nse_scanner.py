@@ -85,11 +85,26 @@ TIMEFRAMES = {
         "interval": "1d", "period": "6mo", "min_candles": 60,
         "sheet_name": "Scan Results - Daily",
         "ema_trend": 50, "rsi_period": 14, "vol_avg_period": 20,
+        # Drop the live intraday candle? No — daily candles close EOD; scanner
+        # runs post-market (16:00 IST), so the last candle IS a closed candle.
+        "drop_live_candle": False,
     },
     "hourly": {
-        "interval": "60m", "period": "3mo", "min_candles": 60,
+        "interval": "60m", "period": "60d", "min_candles": 60,
         "sheet_name": "Scan Results - Hourly",
         "ema_trend": 50, "rsi_period": 14, "vol_avg_period": 20,
+        # FIX Bug-2: yfinance always includes the LIVE (still-open) hourly candle
+        # as the last row. Checking its close for a breakout gives false signals
+        # (price may be above the mother bar intrasession but close back inside).
+        # Drop it so candle_1 is always the last COMPLETED candle.
+        "drop_live_candle": True,
+    },
+    "weekly": {
+        "interval": "1wk", "period": "5y", "min_candles": 60,
+        "sheet_name": "Scan Results - Weekly",
+        "ema_trend": 50, "rsi_period": 14, "vol_avg_period": 20,
+        # Weekly candles close on Friday; run scanner Friday post-market.
+        "drop_live_candle": False,
     },
 }
 
@@ -267,25 +282,28 @@ def analyze_symbol(
     min_turnover_lakhs: float,
 ) -> dict | None:
     """
-    Evaluate the last 3 candles for inside-bar breakout signals.
+    Evaluate the last 3 completed candles for inside-bar breakout signals.
 
-    Candle window (newest last):
-        df.iloc[-3]  = candle_3  (potential mother bar for confirmed breakout)
-        df.iloc[-2]  = candle_2  (potential inside bar / mother bar for WATCH)
-        df.iloc[-1]  = candle_1  (the current / most-recent candle)
+    Candle window (newest last, after dropping any live candle for hourly TF):
+        df.iloc[-3]  = candle_3  (mother bar for confirmed-breakout check)
+        df.iloc[-2]  = candle_2  (inside bar candidate / mother bar for WATCH)
+        df.iloc[-1]  = candle_1  (the most-recently CLOSED candle)
 
     CONFIRMED BREAKOUT  (BULLISH / BEARISH):
-        Condition:  candle_2 is fully inside candle_3
-                    AND candle_1 closes ABOVE candle_3 high  → BULLISH
-                    OR  candle_1 closes BELOW candle_3 low   → BEARISH
-        Rationale:  We require the close to decisively exceed the MOTHER bar's
-                    range, not just the inside bar's range, to avoid weak
-                    breakouts that stall at the inside bar's edges.
+        Condition:  candle_2 is fully inside candle_3 (high ≤ mother high,
+                    low ≥ mother low) AND candle_1 CLOSES beyond the MOTHER
+                    bar's range (not just the inside bar's edges).
+        Rationale:  Requiring a close outside the MOTHER bar's range filters
+                    out weak intrabar pokes that reverse by session end.
 
-    WATCH:
-        Condition:  candle_1 is fully inside candle_2 (fresh inside bar).
-        Rationale:  Direction is unknown; show both trigger levels so the
-                    trader can set a bracket order for the next session.
+    WATCH  — two sub-cases:
+        Case A (simple IB):  candle_1 is inside candle_2 (which is NOT inside
+                    candle_3).  Trigger = candle_2 high / low.
+        Case B (nested IB):  candle_2 is inside candle_3 AND candle_1 is inside
+                    candle_2.  The dominant mother bar is candle_3, so the true
+                    breakout trigger = candle_3 high / low.
+                    [BUG FIX: old code used candle_2's levels here, which is
+                    below the real breakout threshold.]
 
     Scoring (0-3, applied only to confirmed breakouts):
         +1  trend  — close is on the correct side of the 50-period EMA
@@ -294,11 +312,21 @@ def analyze_symbol(
 
     Liquidity gate (applied before any pattern checks):
         Skips stocks where the 20-period average volume < min_avg_volume OR
-        average rupee turnover < min_turnover_lakhs. This prevents signals
-        on stocks that are technically clean but impossible/expensive to trade.
+        average rupee turnover < min_turnover_lakhs.
     """
     if df is None or len(df) < tf["min_candles"]:
         return None
+
+    # ── FIX Bug-2: drop the live/incomplete candle for intraday timeframes ───
+    # yfinance always appends the currently-open candle as the last row when the
+    # market is open.  For hourly scans checking c1_close against the mother
+    # bar's range midway through a session produces false BULLISH/BEARISH hits
+    # that reverse by close.  Dropping the last row means the three-candle
+    # window always uses fully-closed candles.
+    if tf.get("drop_live_candle", False):
+        df = df.iloc[:-1]
+        if len(df) < tf["min_candles"]:
+            return None
 
     n = len(df)
     closes = df["Close"]
@@ -365,17 +393,21 @@ def analyze_symbol(
     # ------------------------------------------------------------------ #
     candle_2_is_inside_candle_3 = (c2_high <= c3_high) and (c2_low >= c3_low)
 
+    # Pre-compute vol ratio for candle_1 (used in both confirmed and WATCH)
+    c1_vol_safe = c1_vol if not pd.isna(c1_vol) else 0.0
+    vol_ratio_raw = (c1_vol_safe / avg_vol_safe) if avg_vol_safe > 0 else None
+    safe_vol_ratio = (
+        round(float(vol_ratio_raw), 2)
+        if (vol_ratio_raw is not None and not pd.isna(vol_ratio_raw))
+        else None
+    )
+
     if candle_2_is_inside_candle_3:
         mother_high = round(c3_high, 2)
         mother_low  = round(c3_low,  2)
         rng = round(mother_high - mother_low, 2)
 
-        # Vol ratio: use candle_1 volume vs prior 20-candle average
-        c1_vol_safe = c1_vol if not pd.isna(c1_vol) else 0.0
-        vol_ratio = (c1_vol_safe / avg_vol_safe) if avg_vol_safe > 0 else None
-        safe_vol_ratio = round(float(vol_ratio), 2) if (vol_ratio is not None and not pd.isna(vol_ratio)) else None
-
-        if c1_close > c3_high:          # BULLISH breakout
+        if c1_close > c3_high:          # ── BULLISH breakout ──────────────
             result.update(
                 pattern="Breakout confirmed",
                 signal="BULLISH",
@@ -397,7 +429,7 @@ def analyze_symbol(
             if CONFIG["rsi_bull_min"] <= float(rsi_last) <= CONFIG["rsi_bull_max"]:
                 result["score"] += 1
 
-        elif c1_close < c3_low:         # BEARISH breakout
+        elif c1_close < c3_low:         # ── BEARISH breakout ──────────────
             result.update(
                 pattern="Breakout confirmed",
                 signal="BEARISH",
@@ -421,20 +453,42 @@ def analyze_symbol(
 
     # ------------------------------------------------------------------ #
     #  Case 2: FRESH INSIDE BAR → WATCH                                   #
-    #    candle_1 (the just-closed candle) is inside candle_2.            #
-    #    No confirmed breakout yet — alert the trader to watch.           #
+    #                                                                      #
+    #  Sub-case A (simple IB):                                            #
+    #    candle_1 is inside candle_2, and candle_2 is NOT inside candle_3 #
+    #    → trigger = candle_2 high/low (the immediate mother bar)         #
+    #                                                                      #
+    #  Sub-case B (nested IB) ← FIX Bug-1:                               #
+    #    candle_2 is inside candle_3 AND candle_1 is inside candle_2.     #
+    #    The dominant mother bar is candle_3. A breakout above candle_2   #
+    #    is still WITHIN candle_3's range, so the true trigger must be    #
+    #    candle_3's high/low. Old code incorrectly showed candle_2 levels #
+    #    here, making the entry look easier than it really is.            #
     # ------------------------------------------------------------------ #
     if result["signal"] == "NONE":
         candle_1_is_inside_candle_2 = (c1_high <= c2_high) and (c1_low >= c2_low)
         if candle_1_is_inside_candle_2:
-            mother_high = round(c2_high, 2)
-            mother_low  = round(c2_low,  2)
+            if candle_2_is_inside_candle_3:
+                # Nested inside bar — use the dominant (outer) mother bar's levels
+                mother_high = round(c3_high, 2)
+                mother_low  = round(c3_low,  2)
+                watch_pattern = "Nested inside bar (watchlist)"
+            else:
+                # Simple inside bar — use candle_2 as the mother bar
+                mother_high = round(c2_high, 2)
+                mother_low  = round(c2_low,  2)
+                watch_pattern = "Inside bar (watchlist)"
+
+            # FIX Bug-4: show vol_ratio for WATCH so the sheet shows whether
+            # the compression candle formed on low volume (healthy) or high
+            # volume (potentially suspicious reversal pressure).
             result.update(
-                pattern="Inside bar (watchlist)",
+                pattern=watch_pattern,
                 signal="WATCH",
                 mother_high=mother_high,
                 mother_low=mother_low,
                 entry=f"Buy>{mother_high} / Sell<{mother_low}",
+                vol_ratio=safe_vol_ratio,
             )
             result["trend"] = (
                 f"above EMA{tf['ema_trend']}" if c1_close > float(ema_last)
@@ -533,7 +587,7 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
 # ============================== MAIN ========================================
 def main():
     parser = argparse.ArgumentParser(description="NSE inside bar scanner")
-    parser.add_argument("--timeframe", choices=["daily", "hourly"], required=True)
+    parser.add_argument("--timeframe", choices=["daily", "hourly", "weekly"], required=True)
     parser.add_argument("--symbols-file", default=None,
                          help="Optional text file, one NSE symbol per line. "
                               "Default: fetch NSE's list, or fall back to Nifty 50.")
@@ -558,6 +612,20 @@ def main():
         print("Outside NSE market hours (9:15 AM-3:30 PM IST, Mon-Fri) — skipping. "
               "Use --force to run anyway.")
         return
+
+    # Weekly scans: only run on Friday after market close (or with --force)
+    if args.timeframe == "weekly" and not args.force:
+        from datetime import date
+        today = date.today()
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        if today.weekday() != 4:  # 4 = Friday
+            print("Weekly scan only runs on Fridays after market close. "
+                  "Use --force to run on any day (e.g. for testing).")
+            return
+        if now_ist.strftime("%H%M") < "1530":
+            print("Weekly scan runs after 15:30 IST to ensure weekly candle is closed. "
+                  "Use --force to override.")
+            return
 
     tf = TIMEFRAMES[args.timeframe]
     all_symbols = load_symbols(args.symbols_file)

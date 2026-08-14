@@ -10,7 +10,10 @@ name: NSE Inside Bar Scanner
 #  Daily scan   runs once at 10:30 UTC (16:00 IST), after NSE close,
 #               so the final day candle is complete and confirmed.
 #
-#  Manual run   available via workflow_dispatch; choose daily or hourly.
+#  Weekly scan  runs once on Friday at 11:00 UTC (16:30 IST), 30 min after
+#               NSE close, so the weekly candle is fully settled.
+#
+#  Manual run   available via workflow_dispatch; choose daily, hourly, or weekly.
 # ──────────────────────────────────────────────────────────────────────────
 
 on:
@@ -19,6 +22,8 @@ on:
     - cron: "30 3-9 * * 1-5"
     # Daily scan:  10:30 UTC every weekday         (= 16:00 IST, post-market)
     - cron: "30 10 * * 1-5"
+    # Weekly scan: 11:00 UTC every Friday          (= 16:30 IST, post-market)
+    - cron: "0 11 * * 5"
   workflow_dispatch:
     inputs:
       timeframe:
@@ -29,6 +34,7 @@ on:
         options:
           - daily
           - hourly
+          - weekly
 
 jobs:
   scan:
@@ -61,6 +67,13 @@ jobs:
       - name: Run daily scan (scheduled)
         if: github.event_name == 'schedule' && github.event.schedule == '30 10 * * 1-5'
         run: python nse_scanner.py --timeframe daily
+
+      # ── Weekly scan ──
+      # Runs only for the Friday 11:00 UTC cron trigger (--force bypasses the
+      # Friday guard in the Python script since GHA already schedules correctly).
+      - name: Run weekly scan (scheduled)
+        if: github.event_name == 'schedule' && github.event.schedule == '0 11 * * 5'
+        run: python nse_scanner.py --timeframe weekly --force
 
       # ── Manual run ──
       - name: Run manual scan
