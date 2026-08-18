@@ -3,7 +3,7 @@
 NSE Inside Bar Scanner — local Python version, writes results into Google Sheets.
 
 WHAT IT DOES
-    Scans NSE symbols priced at or below --max-price (default Rs 500), while
+    Scans NSE symbols (no price cap — every symbol is eligible) while
     skipping low-liquidity names using --min-avg-volume and
     --min-turnover-lakhs, for the "inside bar" pattern on either a daily or
     hourly timeframe, and writes color-coded signals into a worksheet tab of
@@ -35,9 +35,22 @@ PATTERN LOGIC (3-candle window, newest = candle[-1]):
         - If candle[-1] is inside candle[-2]  => WATCH (fresh inside bar)
 
 TWO-STAGE SCAN (keeps this fast even across the whole NSE list)
-    Stage 1: a quick 5-day price check on every symbol, to drop anything
-             priced above --max-price before doing any real work.
+    Stage 1: a quick liquidity check on every symbol (~1 month of daily
+             data) to drop anything that isn't actively traded — average
+             volume and average rupee turnover both have to clear your
+             --min-avg-volume / --min-turnover-lakhs thresholds — before
+             doing any real work. There is no price cap; a stock can be at
+             any price as long as it trades enough volume/turnover.
     Stage 2: full historical fetch + indicator calc, only on what's left.
+             analyze_symbol() re-checks the same liquidity thresholds
+             against the timeframe-specific data, so Stage 1 is purely a
+             speed optimization, not the source of truth.
+
+SECTOR COLUMN
+    Once a symbol produces a signal (WATCH/BULLISH/BEARISH), its sector is
+    looked up via yfinance's `Ticker.info` and written into the sheet. This
+    lookup only happens for the (small) list of symbols with signals, not
+    the whole NSE universe, since per-symbol `.info` calls are slow.
 
 DATA SOURCE
     Yahoo Finance via the `yfinance` package (SYMBOL.NS). Free, no key.
@@ -48,7 +61,6 @@ DATA SOURCE
 USAGE
     python nse_scanner.py --timeframe daily
     python nse_scanner.py --timeframe hourly
-    python nse_scanner.py --timeframe daily --max-price 300
     python nse_scanner.py --timeframe daily --min-avg-volume 200000 --min-turnover-lakhs 100
     python nse_scanner.py --timeframe daily --symbols-file my_symbols.txt
 
@@ -73,11 +85,13 @@ SPREADSHEET_ID = "1YDfmA6wa8t8uqPsavOfsvPzM8SpOTFgxql9wp-07uKk"  # from your she
 
 CONFIG = {
     "vol_ratio_min": 1.5,
-    "min_avg_volume": 100_000,
-    "min_turnover_lakhs": 50.0,
+    # Liquidity gate — raised from the old defaults since there's no more
+    # price cap to naturally thin out illiquid penny stocks. Tune these with
+    # --min-avg-volume / --min-turnover-lakhs as needed.
+    "min_avg_volume": 150_000,
+    "min_turnover_lakhs": 100.0,
     "rsi_bull_min": 40, "rsi_bull_max": 80,
     "rsi_bear_min": 20, "rsi_bear_max": 60,
-    "default_max_price": 500.0,
 }
 
 TIMEFRAMES = {
@@ -127,7 +141,7 @@ SIGNAL_COLOR = {
 WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 HEADER = [
-    "Symbol", "Signal", "Pattern", "Mother High", "Mother Low",
+    "Symbol", "Sector", "Signal", "Pattern", "Mother High", "Mother Low",
     "Last Close", "Avg Volume", "Turnover (L)", "Vol Ratio",
     "Trend vs EMA", "RSI", "Score", "Entry", "Stop Loss", "Target", "Updated At",
 ]
@@ -233,31 +247,38 @@ def extract_symbol_df(data: pd.DataFrame, symbol: str, chunk_len: int) -> pd.Dat
     return df if len(df) > 0 else None
 
 
-def prefilter_by_price(symbols: list[str], max_price: float, chunk_size: int) -> list[str]:
-    """Stage 1: quick price check to drop anything above max_price before the
-    expensive historical fetch. Uses a light 5-day/1-day pull, not the full
-    lookback needed for indicators."""
+def prefilter_by_liquidity(
+    symbols: list[str], min_avg_volume: int, min_turnover_lakhs: float, chunk_size: int
+) -> list[str]:
+    """Stage 1: quick liquidity check to drop anything that isn't actively
+    traded, before the expensive full-history fetch + indicator calc. Pulls
+    ~1 month of daily candles (cheap) and checks average volume + average
+    rupee turnover — the same two gates analyze_symbol() re-applies later
+    with timeframe-accurate data, so this is a speed filter, not the final
+    word. No price cap is applied here or anywhere else in the scanner."""
     keep = []
     chunks = list(chunked(symbols, chunk_size))
     for idx, chunk in enumerate(chunks, 1):
         try:
-            data = fetch_batch(chunk, "1d", "5d")
+            data = fetch_batch(chunk, "1d", "1mo")
         except Exception as e:
-            print(f"  price-check batch {idx}/{len(chunks)} failed: {e}", file=sys.stderr)
+            print(f"  liquidity-check batch {idx}/{len(chunks)} failed: {e}", file=sys.stderr)
             continue
         for sym in chunk:
             try:
                 df = extract_symbol_df(data, sym, len(chunk))
-                if df is None or len(df) == 0:
+                if df is None or len(df) < 5:
                     continue
+                avg_vol = float(df["Volume"].mean())
                 last_close = float(df["Close"].iloc[-1])
-                if pd.isna(last_close):
+                if pd.isna(avg_vol) or pd.isna(last_close):
                     continue
-                if last_close <= max_price:
+                turnover_lakhs = (last_close * avg_vol) / 100_000
+                if avg_vol >= min_avg_volume and turnover_lakhs >= min_turnover_lakhs:
                     keep.append(sym)
             except Exception:
                 continue
-        print(f"  price-check batch {idx}/{len(chunks)} done — {len(keep)} under Rs {max_price} so far")
+        print(f"  liquidity-check batch {idx}/{len(chunks)} done — {len(keep)} actively traded so far")
         time.sleep(0.5)
     return keep
 
@@ -376,7 +397,7 @@ def analyze_symbol(
     # ────────────────────────────────────────────────────────────────────────
 
     result = {
-        "symbol": symbol, "pattern": "", "signal": "NONE",
+        "symbol": symbol, "sector": "N/A", "pattern": "", "signal": "NONE",
         "mother_high": None, "mother_low": None,
         "last_close": round(c1_close, 2),
         "avg_volume": int(round(avg_vol_safe)),
@@ -498,6 +519,22 @@ def analyze_symbol(
     return result if result["signal"] != "NONE" else None
 
 
+# ============================ SECTOR LOOKUP ==================================
+def attach_sectors(results: list[dict]) -> None:
+    """Look up each signal's sector via yfinance Ticker.info and fill it into
+    result['sector'] in place. Only called on the (small) final results list,
+    since .info triggers a separate network call per symbol and is too slow
+    to run across the whole NSE universe."""
+    for r in results:
+        try:
+            info = yf.Ticker(r["symbol"] + ".NS").info
+            sector = info.get("sector") or info.get("sectorDisp") or "N/A"
+            r["sector"] = sector
+        except Exception:
+            r["sector"] = "N/A"
+        time.sleep(0.2)  # polite pacing — this is a per-symbol call
+
+
 # ============================ GOOGLE SHEETS =================================
 def get_gspread_client(credentials_path: str):
     import gspread
@@ -538,7 +575,7 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
 
     results_sorted = sorted(results, key=result_sort_key)
     rows = [
-        [r["symbol"], r["signal"], r["pattern"], r["mother_high"], r["mother_low"],
+        [r["symbol"], r["sector"], r["signal"], r["pattern"], r["mother_high"], r["mother_low"],
          r["last_close"], r["avg_volume"], r["turnover_lakhs"], r["vol_ratio"],
          r["trend"], r["rsi"], r["score"], r["entry"], r["stop_loss"],
          r["target"], r["updated_at"]]
@@ -596,14 +633,12 @@ def main():
     parser.add_argument("--spreadsheet-id", default=SPREADSHEET_ID)
     parser.add_argument("--chunk-size", type=int, default=50,
                          help="Symbols per Yahoo Finance batch request.")
-    parser.add_argument("--max-price", type=float, default=CONFIG["default_max_price"],
-                         help="Only report stocks priced at or below this (Rs). Default 500.")
     parser.add_argument("--min-avg-volume", type=int, default=CONFIG["min_avg_volume"],
-                         help="Only report stocks whose prior average volume meets this threshold. "
-                              "Default 100000 shares.")
+                         help="Only report stocks whose average volume meets this threshold. "
+                              "Default 150000 shares. No price cap is applied.")
     parser.add_argument("--min-turnover-lakhs", type=float, default=CONFIG["min_turnover_lakhs"],
                          help="Only report stocks whose average rupee turnover meets this threshold, "
-                              "in lakhs. Default 50.")
+                              "in lakhs. Default 100.")
     parser.add_argument("--force", action="store_true",
                          help="Run an hourly scan even outside market hours (for testing).")
     args = parser.parse_args()
@@ -629,18 +664,17 @@ def main():
 
     tf = TIMEFRAMES[args.timeframe]
     all_symbols = load_symbols(args.symbols_file)
-    print(f"Loaded {len(all_symbols)} symbols. Filtering to price <= Rs {args.max_price}...")
+    print(f"Loaded {len(all_symbols)} symbols. No price cap — filtering to actively "
+          f"traded names (avg volume >= {args.min_avg_volume:,}, "
+          f"avg turnover >= Rs {args.min_turnover_lakhs:g}L)...")
 
-    symbols = prefilter_by_price(all_symbols, args.max_price, args.chunk_size)
-    print(
-        f"{len(symbols)} symbols at or below Rs {args.max_price}. "
-        f"Skipping stocks below {args.min_avg_volume:,} avg volume or "
-        f"Rs {args.min_turnover_lakhs:g}L average turnover. "
-        f"Running {args.timeframe} scan..."
+    symbols = prefilter_by_liquidity(
+        all_symbols, args.min_avg_volume, args.min_turnover_lakhs, args.chunk_size
     )
+    print(f"{len(symbols)} actively traded symbols. Running {args.timeframe} scan...")
 
     if not symbols:
-        print("No symbols left after the price filter — nothing to scan.")
+        print("No symbols left after the liquidity filter — nothing to scan.")
         return
 
     gc = get_gspread_client(args.credentials)
@@ -665,6 +699,10 @@ def main():
 
         print(f"  batch {idx}/{len(chunks)} done — {len(results)} signals so far")
         time.sleep(1)  # polite pacing between batches
+
+    if results:
+        print(f"Looking up sectors for {len(results)} signals...")
+        attach_sectors(results)
 
     write_results(gc, args.spreadsheet_id, tf["sheet_name"], results)
     print(f"Done. {len(results)} signals written to '{tf['sheet_name']}'.")
