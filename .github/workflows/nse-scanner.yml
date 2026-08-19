@@ -14,6 +14,14 @@ name: NSE Inside Bar Scanner
 #               NSE close, so the weekly candle is fully settled.
 #
 #  Manual run   available via workflow_dispatch; choose daily, hourly, or weekly.
+#
+#  Symbol list  All scans read symbols/nse_equity_list.txt, which is kept
+#               fresh by the separate "Update NSE Symbol List" workflow
+#               (update-nse-symbols.yml). This job never does a live NSE
+#               fetch itself — GitHub-hosted runner IPs get blocked by NSE
+#               far more often than a home connection, and this job runs
+#               too frequently (12+ times/day) to depend on that succeeding
+#               every time. See update-nse-symbols.yml for details.
 # ──────────────────────────────────────────────────────────────────────────
 
 on:
@@ -56,26 +64,34 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
+      - name: Verify symbol list exists
+        run: |
+          if [ ! -s symbols/nse_equity_list.txt ]; then
+            echo "::error::symbols/nse_equity_list.txt is missing or empty. Run the 'Update NSE Symbol List' workflow first (workflow_dispatch), then re-run this scan."
+            exit 1
+          fi
+          echo "Using $(wc -l < symbols/nse_equity_list.txt) symbols from symbols/nse_equity_list.txt"
+
       # ── Hourly scan ──
       # Runs only for the 03:30–09:30 UTC cron triggers (not the 10:30 daily one).
       - name: Run hourly scan (scheduled)
         if: github.event_name == 'schedule' && github.event.schedule == '30 3-9 * * 1-5'
-        run: python nse_scanner.py --timeframe hourly
+        run: python nse_scanner.py --timeframe hourly --symbols-file symbols/nse_equity_list.txt
 
       # ── Daily scan ──
       # Runs only for the 10:30 UTC cron trigger.
       - name: Run daily scan (scheduled)
         if: github.event_name == 'schedule' && github.event.schedule == '30 10 * * 1-5'
-        run: python nse_scanner.py --timeframe daily
+        run: python nse_scanner.py --timeframe daily --symbols-file symbols/nse_equity_list.txt
 
       # ── Weekly scan ──
       # Runs only for the Friday 11:00 UTC cron trigger (--force bypasses the
       # Friday guard in the Python script since GHA already schedules correctly).
       - name: Run weekly scan (scheduled)
         if: github.event_name == 'schedule' && github.event.schedule == '0 11 * * 5'
-        run: python nse_scanner.py --timeframe weekly --force
+        run: python nse_scanner.py --timeframe weekly --force --symbols-file symbols/nse_equity_list.txt
 
       # ── Manual run ──
       - name: Run manual scan
         if: github.event_name == 'workflow_dispatch'
-        run: python nse_scanner.py --timeframe ${{ github.event.inputs.timeframe }} --force
+        run: python nse_scanner.py --timeframe ${{ github.event.inputs.timeframe }} --force --symbols-file symbols/nse_equity_list.txt
