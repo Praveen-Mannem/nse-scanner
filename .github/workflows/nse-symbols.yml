@@ -1,0 +1,59 @@
+name: Update NSE Symbol List
+# ─── Why this exists ───────────────────────────────────────────────────────
+# The main scanner workflow runs on GitHub-hosted (datacenter) IPs, which NSE
+# blocks/rate-limits far more aggressively than a home connection. Rather
+# than have every hourly scan depend on a live NSE fetch succeeding, this
+# workflow is the ONLY place that talks to NSE for the symbol list. It
+# fetches the full equity list and commits it to the repo. The scan jobs in
+# nse-scanner.yml then always read symbols/nse_equity_list.txt — no live
+# dependency, no risk of silently under-scanning or hard-failing mid-market.
+#
+# Runs weekly (Sunday, when the market is closed and there's no rush) plus
+# on-demand via workflow_dispatch. Adjust the cron if you want it fresher.
+# ─────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"  # Sunday 02:00 UTC (07:30 IST) — quiet, market closed
+  workflow_dispatch: {}
+
+jobs:
+  refresh-symbols:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch NSE equity list
+        run: |
+          mkdir -p symbols
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from nse_scanner import load_symbols
+
+          # allow_fallback_list=False: if NSE is unreachable even from this
+          # dedicated job, we WANT it to fail loudly rather than commit a
+          # stale/tiny list — the old symbols file just stays as-is.
+          symbols = load_symbols(symbols_file=None, allow_fallback_list=False)
+          with open("symbols/nse_equity_list.txt", "w") as f:
+              f.write("\n".join(symbols))
+          print(f"Wrote {len(symbols)} symbols to symbols/nse_equity_list.txt")
+          PY
+
+      - name: Commit updated symbol list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add symbols/nse_equity_list.txt
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: refresh NSE symbol list [automated]"
+          git push
