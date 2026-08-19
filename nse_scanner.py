@@ -58,6 +58,23 @@ DATA SOURCE
     for illiquid names — treat it as "near-live" for spotting setups, not
     as a tick-accurate execution feed.
 
+SYMBOL UNIVERSE (fixed — see load_symbols)
+    NSE's archives host (nsearchives.nseindia.com) blocks plain scripted
+    requests without a warmed-up session/cookies, which used to cause a
+    SILENT fallback to a 47-stock Nifty-50 list — meaning most of the NSE
+    universe (incl. mid/small caps like ELGIEQUIP) was never scanned, with
+    no obvious error. load_symbols() now:
+        1. Warms up a requests.Session against nseindia.com to collect the
+           cookies NSE expects, then requests the CSV with proper headers.
+        2. Retries a few times with backoff before giving up.
+        3. Falls back to the NSE company master API as a second source.
+        4. Falls back to a bundled/cached local symbol file if you keep one
+           (--symbols-file always wins if you pass it).
+        5. Only as an absolute last resort does it use the 47-stock
+           Nifty-50 list — and when it does, it now prints a loud WARNING
+           (not a quiet stderr note) and requires --allow-fallback-list to
+           proceed, so you can never silently under-scan again.
+
 USAGE
     python nse_scanner.py --timeframe daily
     python nse_scanner.py --timeframe hourly
@@ -107,7 +124,7 @@ TIMEFRAMES = {
         "interval": "60m", "period": "60d", "min_candles": 60,
         "sheet_name": "Scan Results - Hourly",
         "ema_trend": 50, "rsi_period": 14, "vol_avg_period": 20,
-        # FIX Bug-2: yfinance always includes the LIVE (still-open) hourly candle
+        # yfinance always includes the LIVE (still-open) hourly candle
         # as the last row. Checking its close for a breakout gives false signals
         # (price may be above the mother bar intrasession but close back inside).
         # Drop it so candle_1 is always the last COMPLETED candle.
@@ -130,7 +147,8 @@ NIFTY50_FALLBACK = [
     "COALINDIA", "BAJAJFINSV", "TECHM", "INDUSINDBK", "DRREDDY", "GRASIM", "CIPLA",
     "EICHERMOT", "BRITANNIA", "DIVISLAB", "HEROMOTOCO", "BPCL", "HDFCLIFE", "SBILIFE",
     "APOLLOHOSP", "TATACONSUM", "UPL", "BAJAJ-AUTO",
-]  # Approximate starter list only — pass --symbols-file for full NSE coverage.
+]  # Absolute last-resort only — this is NOT full NSE coverage (mid/small caps
+   # like ELGIEQUIP are NOT in this list). See load_symbols().
 
 SIGNAL_RANK = {"BULLISH": 0, "BEARISH": 1, "WATCH": 2}
 SIGNAL_COLOR = {
@@ -157,29 +175,161 @@ def is_market_hours() -> bool:
 
 
 # ============================ SYMBOL LIST ===================================
-def load_symbols(symbols_file: str | None) -> list[str]:
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/market-data/securities-available-for-trading",
+}
+
+# Local on-disk cache so a successful fetch survives NSE being unreachable
+# on a later run. Refresh automatically if older than CACHE_MAX_AGE_DAYS.
+SYMBOL_CACHE_PATH = Path(__file__).resolve().parent / "nse_symbols_cache.txt"
+CACHE_MAX_AGE_DAYS = 7
+
+
+def _nse_session() -> requests.Session:
+    """NSE's archives host rejects cold requests with no cookies. Warming up
+    against the main site first (like a real browser landing on the page
+    before the CSV downloads) is what actually earns a 200 instead of a
+    403/999 block."""
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
+    try:
+        s.get("https://www.nseindia.com", timeout=10)
+        s.get("https://www.nseindia.com/market-data/securities-available-for-trading", timeout=10)
+    except Exception:
+        pass  # even if the warm-up fails, still attempt the real request below
+    return s
+
+
+def _fetch_equity_list_csv(session: requests.Session) -> list[str] | None:
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    resp = session.get(url, timeout=15)
+    if resp.status_code != 200 or not resp.text.strip():
+        return None
+    reader = csv.reader(resp.text.splitlines())
+    next(reader, None)  # header row
+    syms = [row[0].strip() for row in reader if row and row[0].strip()]
+    return syms or None
+
+
+def _fetch_equity_list_api(session: requests.Session) -> list[str] | None:
+    """Secondary source: NSE's equity master API. Different endpoint, same
+    domain — sometimes available when the archives CSV path is rate-limited."""
+    url = "https://www.nseindia.com/api/equity-master"
+    resp = session.get(url, timeout=15)
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    syms: list[str] = []
+    if isinstance(data, dict):
+        for group in data.values():
+            if isinstance(group, list):
+                syms.extend(str(s).strip() for s in group if str(s).strip())
+    return sorted(set(syms)) or None
+
+
+def _read_cache() -> list[str] | None:
+    if not SYMBOL_CACHE_PATH.exists():
+        return None
+    age_days = (time.time() - SYMBOL_CACHE_PATH.stat().st_mtime) / 86400
+    with SYMBOL_CACHE_PATH.open() as f:
+        syms = [line.strip() for line in f if line.strip()]
+    if not syms:
+        return None
+    if age_days > CACHE_MAX_AGE_DAYS:
+        print(
+            f"  (cached symbol list is {age_days:.0f} days old — using it, but "
+            f"consider refreshing with a fresh --symbols-file)",
+            file=sys.stderr,
+        )
+    return syms
+
+
+def _write_cache(symbols: list[str]) -> None:
+    try:
+        with SYMBOL_CACHE_PATH.open("w") as f:
+            f.write("\n".join(symbols))
+    except Exception:
+        pass  # cache is a nice-to-have, never fatal
+
+
+def load_symbols(symbols_file: str | None, allow_fallback_list: bool, max_retries: int = 3) -> list[str]:
+    """
+    Resolution order (first success wins), so a full NSE scan is the default
+    and the tiny Nifty-50 list is only ever used deliberately, never silently:
+        1. --symbols-file, if given (always wins — you're explicit).
+        2. NSE archives CSV (full listed-equity universe), with a warmed-up
+           session, proper headers, and retries.
+        3. NSE equity-master API as a second live source.
+        4. Local on-disk cache from a previous successful run.
+        5. NIFTY50_FALLBACK — ONLY if --allow-fallback-list was passed;
+           otherwise this raises so you can't accidentally under-scan.
+    """
     if symbols_file:
         path = Path(symbols_file)
         with path.open() as f:
-            return [line.strip() for line in f if line.strip()]
+            syms = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(syms)} symbols from {symbols_file}.")
+        return syms
+
+    session = _nse_session()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            syms = _fetch_equity_list_csv(session)
+            if syms:
+                print(f"Fetched {len(syms)} symbols from NSE archives CSV (attempt {attempt}).")
+                _write_cache(syms)
+                return syms
+        except Exception as e:
+            print(f"  NSE CSV fetch attempt {attempt}/{max_retries} failed: {e}", file=sys.stderr)
+        if attempt < max_retries:
+            time.sleep(2 * attempt)  # backoff: 2s, 4s, ...
 
     try:
-        url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if resp.status_code == 200:
-            reader = csv.reader(resp.text.splitlines())
-            next(reader)  # header
-            syms = [row[0].strip() for row in reader if row and row[0].strip()]
-            if syms:
-                return syms
-    except Exception:
-        pass
+        syms = _fetch_equity_list_api(session)
+        if syms:
+            print(f"Fetched {len(syms)} symbols from NSE equity-master API (fallback source).")
+            _write_cache(syms)
+            return syms
+    except Exception as e:
+        print(f"  NSE equity-master API fetch failed: {e}", file=sys.stderr)
+
+    cached = _read_cache()
+    if cached:
+        print(f"NSE is unreachable right now — using {len(cached)} symbols from local cache "
+              f"({SYMBOL_CACHE_PATH}).")
+        return cached
+
+    if not allow_fallback_list:
+        print(
+            "\nERROR: Could not fetch the live NSE symbol list from any source "
+            "(archives CSV, equity-master API), and no local cache exists yet.\n"
+            "Refusing to silently fall back to the 47-stock Nifty-50 list, since "
+            "that would scan only large caps and miss most of NSE (mid/small caps "
+            "like ELGIEQUIP included).\n\n"
+            "Options:\n"
+            "  1. Re-run later / check your network — NSE occasionally rate-limits.\n"
+            "  2. Download EQUITY_L.csv yourself from nseindia.com in a browser and "
+            "pass it with --symbols-file EQUITY_L.csv\n"
+            "  3. Pass --allow-fallback-list to explicitly accept scanning only the "
+            "47-stock Nifty-50 starter list (NOT recommended for full coverage).\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(
-        "Could not fetch the live NSE symbol list (NSE often blocks non-browser "
-        "requests). Using a 47-stock starter list instead.\n"
-        "For full NSE coverage: download EQUITY_L.csv from nseindia.com yourself "
-        "and pass it with --symbols-file (one symbol per line).",
+        "\nWARNING: Falling back to the 47-stock Nifty-50 starter list because "
+        "--allow-fallback-list was passed. This is NOT full NSE coverage — "
+        "mid/small caps will be skipped.\n",
         file=sys.stderr,
     )
     return NIFTY50_FALLBACK
@@ -323,8 +473,6 @@ def analyze_symbol(
         Case B (nested IB):  candle_2 is inside candle_3 AND candle_1 is inside
                     candle_2.  The dominant mother bar is candle_3, so the true
                     breakout trigger = candle_3 high / low.
-                    [BUG FIX: old code used candle_2's levels here, which is
-                    below the real breakout threshold.]
 
     Scoring (0-3, applied only to confirmed breakouts):
         +1  trend  — close is on the correct side of the 50-period EMA
@@ -338,12 +486,10 @@ def analyze_symbol(
     if df is None or len(df) < tf["min_candles"]:
         return None
 
-    # ── FIX Bug-2: drop the live/incomplete candle for intraday timeframes ───
-    # yfinance always appends the currently-open candle as the last row when the
-    # market is open.  For hourly scans checking c1_close against the mother
-    # bar's range midway through a session produces false BULLISH/BEARISH hits
-    # that reverse by close.  Dropping the last row means the three-candle
-    # window always uses fully-closed candles.
+    # Drop the live/incomplete candle for intraday timeframes. yfinance
+    # always appends the currently-open candle as the last row when the
+    # market is open. Checking its close for a breakout mid-session
+    # produces false BULLISH/BEARISH hits that reverse by close.
     if tf.get("drop_live_candle", False):
         df = df.iloc[:-1]
         if len(df) < tf["min_candles"]:
@@ -479,12 +625,11 @@ def analyze_symbol(
     #    candle_1 is inside candle_2, and candle_2 is NOT inside candle_3 #
     #    → trigger = candle_2 high/low (the immediate mother bar)         #
     #                                                                      #
-    #  Sub-case B (nested IB) ← FIX Bug-1:                               #
+    #  Sub-case B (nested IB):                                            #
     #    candle_2 is inside candle_3 AND candle_1 is inside candle_2.     #
     #    The dominant mother bar is candle_3. A breakout above candle_2   #
     #    is still WITHIN candle_3's range, so the true trigger must be    #
-    #    candle_3's high/low. Old code incorrectly showed candle_2 levels #
-    #    here, making the entry look easier than it really is.            #
+    #    candle_3's high/low.                                             #
     # ------------------------------------------------------------------ #
     if result["signal"] == "NONE":
         candle_1_is_inside_candle_2 = (c1_high <= c2_high) and (c1_low >= c2_low)
@@ -500,8 +645,8 @@ def analyze_symbol(
                 mother_low  = round(c2_low,  2)
                 watch_pattern = "Inside bar (watchlist)"
 
-            # FIX Bug-4: show vol_ratio for WATCH so the sheet shows whether
-            # the compression candle formed on low volume (healthy) or high
+            # Show vol_ratio for WATCH so the sheet shows whether the
+            # compression candle formed on low volume (healthy) or high
             # volume (potentially suspicious reversal pressure).
             result.update(
                 pattern=watch_pattern,
@@ -587,7 +732,7 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
 
     # Reset formatting, then color-code contiguous blocks of the same signal.
     num_cols = len(HEADER)
-    requests = [{
+    requests_batch = [{
         "repeatCell": {
             "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": max(len(rows) + 1, 2),
                        "startColumnIndex": 0, "endColumnIndex": num_cols},
@@ -607,7 +752,7 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
                 signal = results_sorted[block_start]["signal"]
                 color = SIGNAL_COLOR.get(signal)
                 if color:
-                    requests.append({
+                    requests_batch.append({
                         "repeatCell": {
                             "range": {"sheetId": ws.id,
                                        "startRowIndex": block_start + 1, "endRowIndex": i + 1,
@@ -618,7 +763,7 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
                     })
                 block_start = i
 
-    sh.batch_update({"requests": requests})
+    sh.batch_update({"requests": requests_batch})
 
 
 # ============================== MAIN ========================================
@@ -627,7 +772,13 @@ def main():
     parser.add_argument("--timeframe", choices=["daily", "hourly", "weekly"], required=True)
     parser.add_argument("--symbols-file", default=None,
                          help="Optional text file, one NSE symbol per line. "
-                              "Default: fetch NSE's list, or fall back to Nifty 50.")
+                              "Default: fetch NSE's full list live (with retries/cache). "
+                              "Always wins over live fetch if given.")
+    parser.add_argument("--allow-fallback-list", action="store_true",
+                         help="If the live NSE symbol fetch AND the local cache both fail, "
+                              "allow falling back to the 47-stock Nifty-50 starter list "
+                              "instead of exiting with an error. Off by default so you never "
+                              "silently under-scan.")
     parser.add_argument("--credentials", default="credentials.json",
                          help="Path to the Google service account JSON key.")
     parser.add_argument("--spreadsheet-id", default=SPREADSHEET_ID)
@@ -640,7 +791,7 @@ def main():
                          help="Only report stocks whose average rupee turnover meets this threshold, "
                               "in lakhs. Default 100.")
     parser.add_argument("--force", action="store_true",
-                         help="Run an hourly scan even outside market hours (for testing).")
+                         help="Run an hourly/weekly scan even outside market hours (for testing).")
     args = parser.parse_args()
 
     if args.timeframe == "hourly" and not args.force and not is_market_hours():
@@ -663,7 +814,7 @@ def main():
             return
 
     tf = TIMEFRAMES[args.timeframe]
-    all_symbols = load_symbols(args.symbols_file)
+    all_symbols = load_symbols(args.symbols_file, args.allow_fallback_list)
     print(f"Loaded {len(all_symbols)} symbols. No price cap — filtering to actively "
           f"traded names (avg volume >= {args.min_avg_volume:,}, "
           f"avg turnover >= Rs {args.min_turnover_lakhs:g}L)...")
