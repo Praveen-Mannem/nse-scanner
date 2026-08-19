@@ -766,6 +766,114 @@ def write_results(gc, spreadsheet_id: str, sheet_name: str, results: list[dict])
     sh.batch_update({"requests": requests_batch})
 
 
+# ============================ DEBUG ONE SYMBOL ===============================
+def debug_symbol(symbol: str, tf: dict, min_avg_volume: int, min_turnover_lakhs: float) -> None:
+    """Fetch one symbol and print exactly why it did/didn't produce a signal —
+    the last 3 candles' OHLC, liquidity numbers, and every pattern condition
+    with its true/false result. Use this instead of guessing when a stock
+    you can see breaking out on a chart isn't showing up in the sheet."""
+    print(f"\n=== Debugging {symbol} on timeframe={tf['sheet_name']} "
+          f"(interval={tf['interval']}, period={tf['period']}) ===\n")
+
+    try:
+        data = fetch_batch([symbol], tf["interval"], tf["period"])
+    except Exception as e:
+        print(f"Fetch failed: {e}")
+        return
+
+    df = extract_symbol_df(data, symbol, 1)
+    if df is None:
+        print(f"No usable data returned for {symbol}.NS — check the symbol is correct "
+              f"and actually has {tf['interval']} history on Yahoo Finance.")
+        return
+
+    print(f"Fetched {len(df)} candles (need >= {tf['min_candles']} for indicators to warm up).")
+
+    if tf.get("drop_live_candle", False):
+        print("This timeframe drops the live/still-open candle (drop_live_candle=True).")
+        df = df.iloc[:-1]
+        print(f"{len(df)} candles remain after dropping it.")
+
+    if len(df) < tf["min_candles"]:
+        print(f"NOT ENOUGH DATA: {len(df)} < {tf['min_candles']} required candles. "
+              f"This symbol will be skipped entirely regardless of pattern/liquidity.")
+        return
+
+    n = len(df)
+    closes = df["Close"]
+    ema = closes.ewm(span=tf["ema_trend"], adjust=False, min_periods=tf["ema_trend"]).mean()
+    rsi = calc_rsi(closes, tf["rsi_period"])
+    vol = df["Volume"]
+    ema_last, rsi_last = ema.iloc[-1], rsi.iloc[-1]
+    avg_vol = vol.iloc[max(0, n - 1 - tf["vol_avg_period"]) : n - 1].mean()
+
+    c1, c2, c3 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    c1_high, c1_low, c1_close = float(c1["High"]), float(c1["Low"]), float(c1["Close"])
+    c2_high, c2_low = float(c2["High"]), float(c2["Low"])
+    c3_high, c3_low = float(c3["High"]), float(c3["Low"])
+
+    print("\nLast 3 candles (oldest to newest):")
+    print(f"  candle_3 (mother bar candidate) : idx={df.index[-3]}  "
+          f"High={c3_high:.2f}  Low={c3_low:.2f}")
+    print(f"  candle_2 (inside bar candidate) : idx={df.index[-2]}  "
+          f"High={c2_high:.2f}  Low={c2_low:.2f}")
+    print(f"  candle_1 (latest closed candle) : idx={df.index[-1]}  "
+          f"High={c1_high:.2f}  Low={c1_low:.2f}  Close={c1_close:.2f}")
+
+    avg_vol_safe = float(avg_vol) if avg_vol is not None and not pd.isna(avg_vol) else 0.0
+    turnover_lakhs = (c1_close * avg_vol_safe) / 100_000 if avg_vol_safe > 0 else 0.0
+    liquidity_ok = avg_vol_safe >= min_avg_volume and turnover_lakhs >= min_turnover_lakhs
+
+    print(f"\nLiquidity gate (needs avg_volume >= {min_avg_volume:,} "
+          f"AND turnover >= {min_turnover_lakhs:g}L):")
+    print(f"  avg_volume (20-period) = {avg_vol_safe:,.0f}   -> "
+          f"{'PASS' if avg_vol_safe >= min_avg_volume else 'FAIL'}")
+    print(f"  turnover (lakhs)       = {turnover_lakhs:,.2f}   -> "
+          f"{'PASS' if turnover_lakhs >= min_turnover_lakhs else 'FAIL'}")
+    if not liquidity_ok:
+        print("  => LIQUIDITY GATE FAILS. This symbol is skipped before any pattern "
+              "check runs, regardless of what the chart shows.")
+        return
+    print("  => Liquidity gate passes.")
+
+    c2_inside_c3 = (c2_high <= c3_high) and (c2_low >= c3_low)
+    c1_inside_c2 = (c1_high <= c2_high) and (c1_low >= c2_low)
+
+    print(f"\nPattern conditions:")
+    print(f"  candle_2 fully inside candle_3?  "
+          f"(c2_high {c2_high:.2f} <= c3_high {c3_high:.2f}) AND "
+          f"(c2_low {c2_low:.2f} >= c3_low {c3_low:.2f})  -> "
+          f"{'TRUE' if c2_inside_c3 else 'FALSE'}")
+
+    if c2_inside_c3:
+        print(f"  candle_1 close vs mother bar:  close={c1_close:.2f}  "
+              f"mother_high={c3_high:.2f}  mother_low={c3_low:.2f}")
+        if c1_close > c3_high:
+            print("  => BULLISH breakout condition MET (close > mother_high).")
+        elif c1_close < c3_low:
+            print("  => BEARISH breakout condition MET (close < mother_low).")
+        else:
+            print("  => Inside bar formed, but candle_1 has NOT yet closed beyond the "
+                  "mother bar's range in either direction. No confirmed breakout signal "
+                  "(it may still show as WATCH if candle_1 is inside candle_2).")
+    else:
+        print("  => No confirmed-breakout signal is possible on THIS candle: candle_2 is "
+              "not fully contained within candle_3. If your chart shows a strong move that "
+              "still doesn't look like a clean 2-candle inside-bar setup by the strict "
+              "high<=high / low>=low definition, that's why — not a liquidity or symbol-list "
+              "issue.")
+
+    print(f"\n  candle_1 inside candle_2? "
+          f"(c1_high {c1_high:.2f} <= c2_high {c2_high:.2f}) AND "
+          f"(c1_low {c1_low:.2f} >= c2_low {c2_low:.2f})  -> "
+          f"{'TRUE (WATCH-eligible)' if c1_inside_c2 else 'FALSE'}")
+
+    print(f"\nNote: only the LAST 3 candles are ever evaluated. If the breakout you're "
+          f"seeing on a chart happened more than 1-2 candles ago relative to when this "
+          f"scan runs, it has already scrolled out of this window and will not appear, "
+          f"even though it's still visible on the chart today.\n")
+
+
 # ============================== MAIN ========================================
 def main():
     parser = argparse.ArgumentParser(description="NSE inside bar scanner")
@@ -792,7 +900,18 @@ def main():
                               "in lakhs. Default 100.")
     parser.add_argument("--force", action="store_true",
                          help="Run an hourly/weekly scan even outside market hours (for testing).")
+    parser.add_argument("--debug-symbol", default=None,
+                         help="Diagnose exactly why ONE symbol (e.g. ELGIEQUIP) is or isn't "
+                              "producing a signal on the given --timeframe: prints the last 3 "
+                              "candles' OHLC, the liquidity numbers, and each pattern condition "
+                              "with its true/false result. Skips the full scan and Google Sheets "
+                              "write entirely — this is a read-only lookup.")
     args = parser.parse_args()
+
+    if args.debug_symbol:
+        debug_symbol(args.debug_symbol, TIMEFRAMES[args.timeframe],
+                     args.min_avg_volume, args.min_turnover_lakhs)
+        return
 
     if args.timeframe == "hourly" and not args.force and not is_market_hours():
         print("Outside NSE market hours (9:15 AM-3:30 PM IST, Mon-Fri) — skipping. "
