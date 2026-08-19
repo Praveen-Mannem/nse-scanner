@@ -43,6 +43,10 @@ on:
           - daily
           - hourly
           - weekly
+      debug_symbol:
+        description: "Optional: NSE symbol (e.g. ELGIEQUIP) to diagnose instead of running the full scan. Leave blank for a normal manual run."
+        required: false
+        default: ""
 
 jobs:
   scan:
@@ -93,5 +97,14 @@ jobs:
 
       # ── Manual run ──
       - name: Run manual scan
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug_symbol == ''
         run: python nse_scanner.py --timeframe ${{ github.event.inputs.timeframe }} --force --symbols-file symbols/nse_equity_list.txt
+
+      # ── Debug a single symbol ──
+      # Prints the last 3 candles, liquidity numbers, and every pattern
+      # condition (true/false) for one symbol instead of running the full
+      # scan. Use this to see exactly why a stock you can see breaking out
+      # on a chart isn't showing up in the sheet.
+      - name: Debug single symbol
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug_symbol != ''
+        run: python nse_scanner.py --timeframe ${{ github.event.inputs.timeframe }} --debug-symbol "${{ github.event.inputs.debug_symbol }}"
